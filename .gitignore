@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.cache/
+coverage.xml
+*.cover
+
+# Data & Output
+data/*
+!data/.gitkeep
+output/*
+!output/.gitkeep
+
+# Config (local overrides)
+configs/*local*
+configs/*override*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
