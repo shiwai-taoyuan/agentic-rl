@@ -3,17 +3,14 @@ model:
   torch_dtype: bfloat16
 
 lora:
-  r: 16
-  alpha: 32
+  r: 8
+  alpha: 16
   dropout: 0.05
   target_modules:
     - q_proj
     - k_proj
     - v_proj
     - o_proj
-    - gate_proj
-    - up_proj
-    - down_proj
 
 grpo:
   learning_rate: 5.0e-6
@@ -33,3 +30,21 @@ grpo:
 
 data:
   train_file: "data/train.json"
+
+reward:
+  # Weight overrides (merged with defaults). Comment out for defaults.
+  # weights:
+  #   format: 0.10
+  #   tool_selection: 0.15
+  #   parameter: 0.15
+  #   step_order: 0.15
+  #   dependency_usage: 0.15
+  #   step_efficiency: 0.10
+  #   reasoning_depth: 0.10
+  #   outcome_alignment: 0.10
+
+  # LLM judge for reasoning_depth and outcome_alignment.
+  llm_judge:
+    backend: "none"          # "none" | "api"
+    model: ""                # model name/path
+    api_url: ""              # OpenAI-compatible endpoint

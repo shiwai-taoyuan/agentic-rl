@@ -1,6 +1,6 @@
 model:
   model_path: "/Users/wei/Documents/code/checkpoints/Qwen3d5-0d8B"
-  torch_dtype: float32
+  torch_dtype: bfloat16
 
 lora:
   r: 8

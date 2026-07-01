@@ -21,15 +21,20 @@ GRPO_MODEL_PATH = "./output/grpo/final"
 
 def _extract_prompt(
     conversation: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Extract the system + user prompt from a conversation."""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """Extract the system + user prompt and tools definition."""
     prompt: list[dict[str, Any]] = []
+    tools: list[dict[str, Any]] | None = None
     for msg in conversation:
         if msg["role"] in ("system", "user"):
-            prompt.append(msg)
+            if msg["role"] == "system" and "tools" in msg:
+                tools = msg["tools"]
+                prompt.append({"role": "system", "content": msg["content"]})
+            else:
+                prompt.append(msg)
         elif msg["role"] == "assistant" and "tool_calls" in msg:
             break
-    return prompt
+    return prompt, tools
 
 
 def _generate_responses(
@@ -78,7 +83,7 @@ def _generate_responses(
     for i in range(0, len(test_samples), batch_size):
         batch = test_samples[i : i + batch_size]
         for sample in batch:
-            prompt_messages = _extract_prompt(sample.get("conversation", []))
+            prompt_messages, tools = _extract_prompt(sample.get("conversation", []))
             if not prompt_messages:
                 predictions.append({"response": ""})
                 continue
@@ -87,6 +92,8 @@ def _generate_responses(
                 prompt_messages,
                 tokenize=False,
                 add_generation_prompt=True,
+                enable_thinking=True,
+                tools=tools,
             )
             inputs = tokenizer(prompt_text, return_tensors="pt").to(
                 model.device

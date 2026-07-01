@@ -8,4 +8,4 @@ echo " Agentic RL Training Pipeline"
 echo "========================================================"
 echo ""
 
-python -m main --pipeline --samples 3000
+python -m main --pipeline --samples 300

@@ -11,7 +11,7 @@ from peft import LoraConfig, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
-from src.training.reward import compute_total_reward
+from src.training.reward import compute_total_reward, LLMJudge, set_llm_judge
 
 # ---------------------------------------------------------------------------
 # Dataset helpers
@@ -54,6 +54,10 @@ def _load_grpo_dataset(
         return {
             "prompt": prompt,
             "expected_tools": example.get("tools_used", []),
+            "keywords": example.get("keywords", []),
+            "expected_tool_sequence": example.get("expected_tool_sequence", []),
+            "expected_min_steps": example.get("expected_min_steps", 0),
+            "user_prompt": example.get("user_prompt", ""),
         }
 
     ds = ds.map(format_for_grpo, remove_columns=ds.column_names)
@@ -68,14 +72,25 @@ def _load_grpo_dataset(
 def _reward_fn(completions: list[str], **kwargs) -> list[float]:
     """Reward function for ``GRPOTrainer``.
 
-    The trainer passes extra dataset columns (like ``expected_tools``)
-    as keyword arguments.
+    The trainer passes extra dataset columns as keyword arguments.
     """
-    expected_tools = kwargs.get("expected_tools", [[] for _ in completions])
-    keywords = kwargs.get("keywords", [None for _ in completions])
+    n = len(completions)
+    expected_tools = kwargs.get("expected_tools", [[] for _ in range(n)])
+    keywords = kwargs.get("keywords", [[] for _ in range(n)])
+    expected_sequences = kwargs.get("expected_tool_sequence", [[] for _ in range(n)])
+    expected_min_steps_list = kwargs.get("expected_min_steps", [0] * n)
+    user_prompts = kwargs.get("user_prompt", [""] * n)
+
     scores: list[float] = []
-    for comp, exp, kw in zip(completions, expected_tools, keywords):
-        score = compute_total_reward(comp, exp, keywords=kw or None)
+    for i in range(n):
+        score = compute_total_reward(
+            completions[i],
+            expected_tools[i] if i < len(expected_tools) else [],
+            keywords=keywords[i] if i < len(keywords) else None,
+            expected_sequence=expected_sequences[i] if i < len(expected_sequences) else None,
+            expected_min_steps=expected_min_steps_list[i] if i < len(expected_min_steps_list) else 0,
+            user_prompt=user_prompts[i] if i < len(user_prompts) else "",
+        )
         scores.append(score)
     return scores
 
@@ -91,6 +106,17 @@ def train(config_path: str = "configs/grpo_config.yaml") -> None:
         config = yaml.safe_load(f)
 
     model_path = config["model"]["model_path"]
+
+    # Configure LLM judge from reward config (if present)
+    rcfg = config.get("reward", {})
+    jcfg = rcfg.get("llm_judge", {})
+    if jcfg.get("backend", "none") != "none":
+        set_llm_judge(LLMJudge(
+            backend=jcfg.get("backend", ""),
+            model=jcfg.get("model", ""),
+            api_url=jcfg.get("api_url", ""),
+            api_key=jcfg.get("api_key", ""),
+        ))
 
     # Load base model (from SFT checkpoint)
     model = AutoModelForCausalLM.from_pretrained(

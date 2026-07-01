@@ -4,16 +4,27 @@ import json
 
 from src.training.reward import (
     DEFAULT_WEIGHTS,
+    PRECEDENCE_RULES,
+    LLMJudge,
     _extract_tool_calls,
     _try_parse_json,
     _get_required_params,
+    _get_tool_sequence,
+    _extract_reasoning_segments,
+    _lcs_ratio,
     compute_final_answer_reward,
     compute_format_reward,
     compute_parameter_reward,
     compute_reasoning_reward,
     compute_tool_selection_reward,
+    compute_step_order_reward,
+    compute_dependency_usage_reward,
+    compute_step_efficiency_reward,
+    compute_reasoning_depth_reward,
+    compute_outcome_alignment_reward,
     compute_total_reward,
     reward_for_grpo,
+    set_llm_judge,
 )
 
 
@@ -131,10 +142,15 @@ class TestTotalReward:
         assert score < 0.5
 
     def test_custom_weights(self):
+        # Zero out all dims except format; use new weight keys
         score = compute_total_reward(
             VALID_TOOL_CALLS_RESPONSE,
             ["query_database"],
-            weights={"format": 1.0, "tool_selection": 0, "parameter": 0, "reasoning": 0, "final_answer": 0},
+            weights={
+                "format": 1.0, "tool_selection": 0, "parameter": 0,
+                "step_order": 0, "dependency_usage": 0, "step_efficiency": 0,
+                "reasoning_depth": 0, "outcome_alignment": 0,
+            },
         )
         assert score == 1.0
 
@@ -347,14 +363,12 @@ class TestTotalRewardEdgeCases:
         assert score >= 0.0
 
     def test_custom_weights_partial(self):
-        """Partial weights are merged with defaults, so sum may exceed 1.0."""
+        """Partial weights are merged with defaults — score still valid."""
         score = compute_total_reward(
             VALID_TOOL_CALLS_RESPONSE,
             ["query_database"],
             weights={"format": 0.5, "tool_selection": 0.5},
         )
-        # Weights merge with defaults: 0.5 + 0.5 + 0.30(param) + 0.10(reasoning) + 0.10(final) = 1.5
-        # With perfect scores on most dimensions: score ~1.35
         assert score > 0.0
 
 
@@ -369,3 +383,332 @@ class TestRewardForGRPOEdgeCases:
             expected_tools=[["web_search"], ["query_database"]],
         )
         assert len(scores) == 1
+
+
+# ---------------------------------------------------------------------------
+# New planning rationality tests
+# ---------------------------------------------------------------------------
+
+SEQUENTIAL_RESPONSE = (
+    'Thought: I need to search for information first.\n'
+    '"tool_calls": ['
+    '{"function": {"name": "web_search", "arguments": {"query": "AI startups"}}},'
+    '{"function": {"name": "write_file", "arguments": {"path": "/tmp/out.txt", "content": "search results"}}}'
+    ']\n'
+    'Task completed successfully.'
+)
+
+WRONG_ORDER_RESPONSE = (
+    '"tool_calls": ['
+    '{"function": {"name": "write_file", "arguments": {"path": "/tmp/x.txt", "content": "data"}}},'
+    '{"function": {"name": "web_search", "arguments": {"query": "test"}}}'
+    ']'
+)
+
+DUPLICATE_CALLS_RESPONSE = (
+    '"tool_calls": ['
+    '{"function": {"name": "web_search", "arguments": {"query": "test"}}},'
+    '{"function": {"name": "web_search", "arguments": {"query": "test"}}}'
+    ']'
+)
+
+ERROR_RESPONSE = (
+    '"tool_calls": [{"function": {"name": "read_file", '
+    '"arguments": "{\\"path\\": \\"/tmp/missing.txt\\"}}]'
+    'Error: file not found: /tmp/missing.txt. I cannot complete this task.'
+)
+
+
+class TestStepOrderReward:
+    def test_correct_order(self):
+        score = compute_step_order_reward(SEQUENTIAL_RESPONSE)
+        assert score > 0.7
+
+    def test_wrong_order(self):
+        score = compute_step_order_reward(WRONG_ORDER_RESPONSE)
+        assert score < 0.7
+
+    def test_single_tool_always_1(self):
+        score = compute_step_order_reward(
+            '"tool_calls": [{"function": {"name": "web_search", '
+            '"arguments": "{\\"query\\": \\"x\\"}"}}]'
+        )
+        assert score == 1.0
+
+    def test_no_tool_calls(self):
+        score = compute_step_order_reward("no tools")
+        assert score == 1.0
+
+    def test_with_expected_sequence_match(self):
+        score = compute_step_order_reward(
+            SEQUENTIAL_RESPONSE,
+            expected_sequence=["web_search", "write_file"],
+        )
+        assert score > 0.8
+
+    def test_with_expected_sequence_mismatch(self):
+        """LCS ratio against completely different sequence → lower score."""
+        score = compute_step_order_reward(
+            SEQUENTIAL_RESPONSE,
+            expected_sequence=["send_email", "query_database"],
+        )
+        assert score < 0.7
+
+    def test_no_applicable_precedence_rules(self):
+        """Two calls without a defined precedence rule — gets 1.0 precedence."""
+        response = (
+            '"tool_calls": [{"function": {"name": "web_search", '
+            '"arguments": "{\\"query\\": \\"x\\"}"}},'
+            '{"function": {"name": "current_datetime", "arguments": "{}"}}'
+            ']'
+        )
+        score = compute_step_order_reward(response)
+        assert score >= 0.0
+
+
+class TestDependencyUsageReward:
+    def test_references_previous_tool(self):
+        score = compute_dependency_usage_reward(SEQUENTIAL_RESPONSE)
+        assert score > 0.0
+
+    def test_no_references(self):
+        response = (
+            '"tool_calls": [{"function": {"name": "web_search", '
+            '"arguments": "{\\"query\\": \\"x\\"}"}},'
+            '{"function": {"name": "current_datetime", "arguments": "{}"}}'
+            ']'
+        )
+        score = compute_dependency_usage_reward(response)
+        assert score >= 0.0
+
+    def test_single_call(self):
+        score = compute_dependency_usage_reward(
+            '"tool_calls": [{"function": {"name": "web_search", '
+            '"arguments": "{\\"query\\": \\"x\\"}"}}]'
+        )
+        assert score == 1.0
+
+
+class TestStepEfficiencyReward:
+    def test_no_duplicates(self):
+        score = compute_step_efficiency_reward(SEQUENTIAL_RESPONSE)
+        assert score >= 0.8
+
+    def test_duplicate_calls_penalized(self):
+        score = compute_step_efficiency_reward(DUPLICATE_CALLS_RESPONSE)
+        assert score < 1.0
+
+    def test_no_calls(self):
+        score = compute_step_efficiency_reward("no tools")
+        assert score == 1.0
+
+    def test_excessive_vs_min_steps(self):
+        """8 calls with expected_min_steps=2 → 2x more than 2*2=4, penalized."""
+        many_calls = (
+            '"tool_calls": ['
+            + ", ".join(
+                '{"function": {"name": "web_search", '
+                '"arguments": "{\\"query\\": \\"q' + str(i) + '\\"}"}}'
+                for i in range(8)
+            )
+            + "]"
+        )
+        score = compute_step_efficiency_reward(many_calls, expected_min_steps=2)
+        assert score < 1.0
+
+
+class TestReasoningDepthReward:
+    def test_quality_reasoning_scores_high(self):
+        """Reasoning with causal structure and planning."""
+        response = (
+            "因为用户需要计算，所以我需要执行Python来获取结果。\n"
+            "首先验证输入是否正确，然后计算结果并返回。\n"
+            '"tool_calls": [{"function": {"name": "execute_python", '
+            '"arguments": "{\\"code\\": \\"2+3\\"}"}}]'
+        )
+        score = compute_reasoning_depth_reward(response)
+        assert score > 0.3
+
+    def test_superficial_reasoning_scores_low(self):
+        response = (
+            'Let me do this.\n'
+            '"tool_calls": [{"function": {"name": "execute_python", '
+            '"arguments": "{\\"code\\": \\"2+3\\"}"}}]'
+        )
+        score = compute_reasoning_depth_reward(response)
+        assert score < 0.5
+
+    def test_no_reasoning(self):
+        # Short response with tool_call but effectively no reasoning text
+        score = compute_reasoning_depth_reward(
+            '"tool_calls": [{"function": {"name": "w", "arguments": "{}"}}]'
+        )
+        # The whole response is treated as one segment; short → low base
+        assert score < 0.3
+
+
+class TestOutcomeAlignmentReward:
+    def test_successful_completion(self):
+        """Completion with no errors and completion markers."""
+        response = (
+            '"tool_calls": [{"function": {"name": "web_search", '
+            '"arguments": "{\\"query\\": \\"test\\"}"}}]'
+            '搜索已完成。结果为：test - result #1'
+        )
+        score = compute_outcome_alignment_reward(
+            response, user_prompt="搜索 test", keywords=["test"]
+        )
+        assert score > 0.4
+
+    def test_error_response_scores_low(self):
+        score = compute_outcome_alignment_reward(
+            ERROR_RESPONSE, user_prompt="Read a file",
+        )
+        assert score < 0.5
+
+    def test_keywords_boost_score(self):
+        no_kw = compute_outcome_alignment_reward(
+            "Task completed. The result is 42.",
+            keywords=[],
+        )
+        with_kw = compute_outcome_alignment_reward(
+            "Task completed. The result is 42.",
+            keywords=["42", "result"],
+        )
+        assert with_kw >= no_kw
+
+
+class TestUpdatedTotalReward:
+    def test_perfect_sequential_response(self):
+        score = compute_total_reward(
+            SEQUENTIAL_RESPONSE, ["web_search", "write_file"],
+            keywords=["search", "save"],
+            expected_sequence=["web_search", "write_file"],
+            expected_min_steps=2,
+        )
+        assert 0.0 < score <= 1.0
+
+    def test_new_weights_sum_to_1(self):
+        assert abs(sum(DEFAULT_WEIGHTS.values()) - 1.0) < 0.001
+
+    def test_all_eight_dimensions_present(self):
+        expected_dims = {
+            "format", "tool_selection", "parameter",
+            "step_order", "dependency_usage", "step_efficiency",
+            "reasoning_depth", "outcome_alignment",
+        }
+        assert set(DEFAULT_WEIGHTS.keys()) == expected_dims
+
+    def test_no_tools_response_low_score(self):
+        score = compute_total_reward(
+            "I don't know what to do.", ["web_search", "write_file"],
+        )
+        assert score < 0.5
+
+
+class TestUpdatedRewardForGRPO:
+    def test_batch_with_new_fields(self):
+        scores = reward_for_grpo(
+            [SEQUENTIAL_RESPONSE, ERROR_RESPONSE],
+            expected_tools=[["web_search", "write_file"], ["read_file"]],
+            keywords=[["search", "save"], ["file"]],
+            expected_sequences=[["web_search", "write_file"], ["read_file"]],
+            expected_min_steps_list=[2, 1],
+            user_prompts=["Search and save", "Read a file"],
+        )
+        assert len(scores) == 2
+        assert scores[0] > scores[1]
+
+    def test_defaults_for_missing_fields(self):
+        scores = reward_for_grpo(["response_a", "response_b"])
+        assert len(scores) == 2
+        assert all(isinstance(s, float) for s in scores)
+
+
+# ---------------------------------------------------------------------------
+# LLM Judge tests
+# ---------------------------------------------------------------------------
+
+
+class TestLLMJudge:
+    def test_unconfigured_not_available(self):
+        judge = LLMJudge()
+        assert not judge.available()
+
+    def test_parse_score(self):
+        assert LLMJudge._parse_score("5", 5) == 1.0
+        assert LLMJudge._parse_score("1", 5) == 0.2
+        assert LLMJudge._parse_score("3", 5) == 0.6
+        assert LLMJudge._parse_score("no number", 5) == 0.5
+        assert LLMJudge._parse_score("10", 5) == 1.0  # clamped
+        assert LLMJudge._parse_score("0", 5) == 0.0   # clamped
+
+    def test_score_fallback(self):
+        judge = LLMJudge()
+        assert judge.score("prompt", "content") == 0.5
+
+
+class TestSetLLMJudge:
+    def test_set_and_get(self):
+        judge = LLMJudge(backend="api", model="test-model")
+        set_llm_judge(judge)
+        from src.training.reward import get_llm_judge
+        assert get_llm_judge().model == "test-model"
+        set_llm_judge(None)  # reset
+
+
+# ---------------------------------------------------------------------------
+# New helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractReasoningSegments:
+    def test_multiple_segments(self):
+        segments = _extract_reasoning_segments(SEQUENTIAL_RESPONSE)
+        assert len(segments) >= 2
+
+    def test_no_tool_calls(self):
+        segments = _extract_reasoning_segments("just plain reasoning text here enough length")
+        assert len(segments) == 1
+
+    def test_empty_response(self):
+        segments = _extract_reasoning_segments("")
+        assert len(segments) >= 0
+
+
+class TestGetToolSequence:
+    def test_ordered_sequence(self):
+        tool_calls = _extract_tool_calls(SEQUENTIAL_RESPONSE)
+        seq = _get_tool_sequence(tool_calls)
+        names = [name for name, _args in seq]
+        assert names == ["web_search", "write_file"]
+
+    def test_empty(self):
+        assert _get_tool_sequence([]) == []
+
+
+class TestLcsRatio:
+    def test_exact_match(self):
+        assert _lcs_ratio(["a", "b", "c"], ["a", "b", "c"]) == 1.0
+
+    def test_no_match(self):
+        assert _lcs_ratio(["a", "b"], ["c", "d"]) == 0.0
+
+    def test_partial_match(self):
+        ratio = _lcs_ratio(["a", "b", "c"], ["a", "c", "b"])
+        assert 0.0 < ratio < 1.0
+
+    def test_one_empty(self):
+        assert _lcs_ratio([], ["a"]) == 0.0
+
+    def test_both_empty(self):
+        assert _lcs_ratio([], []) == 1.0
+
+
+class TestPrecedenceRules:
+    def test_rules_defined(self):
+        assert len(PRECEDENCE_RULES) > 0
+        for before, after in PRECEDENCE_RULES:
+            assert isinstance(before, str)
+            assert isinstance(after, str)
+            assert before != after

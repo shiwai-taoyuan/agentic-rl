@@ -646,6 +646,50 @@ def _get_tools_used(conversation: list[dict[str, Any]]) -> list[str]:
     return tools
 
 
+def _get_tool_sequence(conversation: list[dict[str, Any]]) -> list[str]:
+    """Extract the ordered tool call sequence from the conversation."""
+    seq: list[str] = []
+    for msg in conversation:
+        tool_calls = msg.get("tool_calls", [])
+        for tc in tool_calls:
+            name = tc.get("function", {}).get("name")
+            if name:
+                seq.append(name)
+    return seq
+
+
+def _get_min_steps(category: str) -> int:
+    """Return the minimum number of tool calls expected for a task category."""
+    return {
+        "single": 1,
+        "sequential": 2,
+        "conditional": 2,
+        "aggregation": 3,
+        "retry": 2,
+    }.get(category, 1)
+
+
+def _extract_keywords(
+    filled_data: dict[str, Any], tool_results: list[str]
+) -> list[str]:
+    """Extract meaningful keywords from filled template data for outcome checking."""
+    keywords: list[str] = []
+    skip_keys = {"user_prompt", "_fixed_code", "_branch", "_query_db1",
+                 "_query_db2", "_aggregate_code", "_file_content",
+                 "_write_content"}
+    for key, value in filled_data.items():
+        if key.startswith("_") or key in skip_keys:
+            continue
+        if isinstance(value, str) and len(value) > 1:
+            words = value.split()
+            for w in words[:2]:
+                clean = w.strip(".,;:!?()[]{}\"'").lower()
+                if len(clean) > 2:
+                    keywords.append(clean)
+                    break
+    return keywords[:5]
+
+
 def generate_dataset(
     samples: int = 3000, seed: int = 42
 ) -> list[dict[str, Any]]:
@@ -688,12 +732,17 @@ def generate_dataset(
             tools_used = _get_tools_used(conversation)
 
             sample_id_counter += 1
+            tool_sequence = _get_tool_sequence(conversation)
             sample: dict[str, Any] = {
                 "id": f"task_{sample_id_counter:05d}",
                 "conversation": conversation,
                 "difficulty": template.difficulty,
                 "tools_used": tools_used,
                 "category": template.category,
+                "expected_tool_sequence": tool_sequence,
+                "expected_min_steps": _get_min_steps(template.category),
+                "keywords": _extract_keywords(filled_data, []),
+                "user_prompt": filled_data["user_prompt"],
             }
             dataset.append(sample)
 
